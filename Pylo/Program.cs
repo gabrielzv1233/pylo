@@ -1,30 +1,27 @@
-﻿using System.Reflection;
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text;
 
 // args:
 // --undo     : restore original names
 // --dry-run  : do not perform any changes, just show what would be done
 
-// compile with: dotnet publish -c Release -r win-x64
+// compile with: dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:PublishTrimmed=false
 
 class Program
 {
-    // ====== CONFIG ======
     const string BuiltInWebhookUrl = "Webhook URL";
-    const bool EXECUTE_BY_DEFAULT = true; // for development, enforces --dry-run, overridden with --execute
+    const bool EXECUTE_BY_DEFAULT = true;
 
-    // ====== STATE ======
     static readonly HttpClient http = new HttpClient();
     static bool Undo = false;
     static bool DryRun = !EXECUTE_BY_DEFAULT;
     static string WebhookUrl = BuiltInWebhookUrl;
 
     static string AppDataDir =>
-    Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        Path.GetFileNameWithoutExtension(Environment.ProcessPath) ?? "Pylo"
-    );
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            Path.GetFileNameWithoutExtension(Environment.ProcessPath) ?? "Pylo"
+        );
 
     static string DirMapPath => Path.Combine(AppDataDir, ".pylo_dirs.orig.json");
     static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
@@ -37,11 +34,9 @@ class Program
             if (x.Equals("--undo", StringComparison.OrdinalIgnoreCase) || x.Equals("/undo", StringComparison.OrdinalIgnoreCase)) Undo = true;
             if (x.Equals("--dry-run", StringComparison.OrdinalIgnoreCase) || x.Equals("/dry-run", StringComparison.OrdinalIgnoreCase)) DryRun = true;
             if (x.Equals("--execute", StringComparison.OrdinalIgnoreCase) || x.Equals("/execute", StringComparison.OrdinalIgnoreCase)) DryRun = false;
-            if (x.StartsWith("--webhook=", StringComparison.OrdinalIgnoreCase)) WebhookUrl = x.Substring(10);
-            if (x.StartsWith("/webhook=", StringComparison.OrdinalIgnoreCase)) WebhookUrl = x.Substring(9);
         }
 
-        string desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+        var desktops = GetDesktopRoots().ToArray();
         string user = Environment.UserName;
         string machine = Environment.MachineName;
         var started = DateTimeOffset.Now;
@@ -55,15 +50,20 @@ class Program
 
             if (!Undo)
             {
-                var files = EnumerateFiles(desktop);
-                var dirs = EnumerateDirs(desktop);
+                var files = desktops.SelectMany(EnumerateFiles).ToList();
+                var dirs = desktops.SelectMany(EnumerateDirs).ToList();
+                var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var root in desktops)
+                    foreach (var p in SnapshotExisting(root))
+                        existing.Add(p);
 
                 var plan = new List<RenamePlan>();
                 foreach (var p in files)
                 {
                     try
                     {
-                        if (IsLockedFile(p)) { skipped++; continue; }
+                        Console.WriteLine($"Discovered file: {p}");
+                        if (IsLockedFile(p)) { Console.WriteLine($"[Skipped locked file] {p}"); skipped++; continue; }
                         plan.Add(new RenamePlan
                         {
                             Kind = ItemKind.File,
@@ -78,7 +78,8 @@ class Program
                 {
                     try
                     {
-                        if (IsLockedDir(d)) { skipped++; continue; }
+                        Console.WriteLine($"Discovered directory: {d}");
+                        if (IsLockedDir(d)) { Console.WriteLine($"[Skipped locked dir] {d}"); skipped++; continue; }
                         plan.Add(new RenamePlan
                         {
                             Kind = ItemKind.Dir,
@@ -90,7 +91,6 @@ class Program
                     catch { errors++; }
                 }
 
-                var existing = SnapshotExisting(desktop);
                 var nextIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                 var assigned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var item in plan)
@@ -120,6 +120,7 @@ class Program
                 {
                     foreach (var item in plan)
                     {
+                        Console.WriteLine($"[Dry Run] Would rename: {item.OriginalPath} -> {item.FinalPath}");
                         changeLines.Add($"{Path.GetFileName(item.OriginalPath)} -> {Path.GetFileName(item.FinalPath)}");
                         renamed++;
                     }
@@ -130,6 +131,7 @@ class Program
                     {
                         try
                         {
+                            Console.WriteLine($"Renaming (temp): {item.OriginalPath} -> {item.TempPath}");
                             if (item.Kind == ItemKind.File)
                             {
                                 TryWriteADS(item.OriginalPath, Path.GetFileName(item.OriginalPath));
@@ -156,6 +158,7 @@ class Program
                                 dirMap[item.FinalPath] = Path.GetFileName(item.OriginalPath);
                             }
 
+                            Console.WriteLine($"Renaming (final): {item.TempPath} -> {item.FinalPath}");
                             if (item.Kind == ItemKind.File) File.Move(item.TempPath, item.FinalPath);
                             else Directory.Move(item.TempPath, item.FinalPath);
 
@@ -165,29 +168,12 @@ class Program
                         catch { errors++; skipped++; }
                     }
                     SaveDirMap(LoadDirMapMerged(changeLines, plan, dirMap));
-
-                    foreach (var item in plan)
-                    {
-                        try
-                        {
-                            if (ExistsPath(item.TempPath))
-                            {
-                                var leftover = item.TempPath + ".leftover";
-                                if (!ExistsPath(leftover))
-                                {
-                                    if (item.Kind == ItemKind.File) File.Move(item.TempPath, leftover);
-                                    else Directory.Move(item.TempPath, leftover);
-                                }
-                            }
-                        }
-                        catch { }
-                    }
                 }
             }
             else
             {
-                var files = EnumerateFiles(desktop);
-                var dirs = EnumerateDirs(desktop);
+                var files = desktops.SelectMany(EnumerateFiles).ToList();
+                var dirs = desktops.SelectMany(EnumerateDirs).ToList();
                 var dirMap = LoadDirMap();
 
                 if (DryRun)
@@ -196,6 +182,7 @@ class Program
                     {
                         try
                         {
+                            Console.WriteLine($"[Dry Run] Checking restore for file: {p}");
                             string? orig = TryReadADS(p);
                             if (string.IsNullOrEmpty(orig)) { skipped++; continue; }
                             string parent = Path.GetDirectoryName(p)!;
@@ -203,6 +190,7 @@ class Program
                             string target = Path.Combine(parent, safe);
                             if (ExistsPath(target))
                                 target = UniqueCollisionName(parent, Path.GetFileNameWithoutExtension(safe), Path.GetExtension(safe), isDir: false);
+                            Console.WriteLine($"[Dry Run] Would restore: {p} -> {target}");
                             changeLines.Add($"{Path.GetFileName(p)} -> {Path.GetFileName(target)}");
                             restored++;
                         }
@@ -212,12 +200,14 @@ class Program
                     {
                         try
                         {
+                            Console.WriteLine($"[Dry Run] Checking restore for dir: {d}");
                             if (!dirMap.TryGetValue(d, out var orig)) { skipped++; continue; }
                             string parent = Path.GetDirectoryName(d)!;
                             string safe = SanitizeFileName(orig);
                             string target = Path.Combine(parent, safe);
                             if (ExistsPath(target))
                                 target = UniqueCollisionName(parent, safe, "", isDir: true);
+                            Console.WriteLine($"[Dry Run] Would restore: {d} -> {target}");
                             changeLines.Add($"{Path.GetFileName(d)} -> {Path.GetFileName(target)}");
                             restored++;
                         }
@@ -230,6 +220,7 @@ class Program
                     {
                         try
                         {
+                            Console.WriteLine($"Restoring file: {p}");
                             string? orig = TryReadADS(p);
                             if (string.IsNullOrEmpty(orig)) { skipped++; continue; }
                             string parent = Path.GetDirectoryName(p)!;
@@ -237,6 +228,7 @@ class Program
                             string target = Path.Combine(parent, safe);
                             if (ExistsPath(target))
                                 target = UniqueCollisionName(parent, Path.GetFileNameWithoutExtension(safe), Path.GetExtension(safe), isDir: false);
+                            Console.WriteLine($" -> Restored: {p} -> {target}");
                             File.Move(p, target);
                             changeLines.Add($"{Path.GetFileName(p)} -> {Path.GetFileName(target)}");
                             restored++;
@@ -244,26 +236,26 @@ class Program
                         catch { errors++; }
                     }
 
-                    bool mapChanged = false;
                     foreach (var d in dirs)
                     {
                         try
                         {
+                            Console.WriteLine($"Restoring dir: {d}");
                             if (!dirMap.TryGetValue(d, out var orig)) { skipped++; continue; }
                             string parent = Path.GetDirectoryName(d)!;
                             string safe = SanitizeFileName(orig);
                             string target = Path.Combine(parent, safe);
                             if (ExistsPath(target))
                                 target = UniqueCollisionName(parent, safe, "", isDir: true);
+                            Console.WriteLine($" -> Restored: {d} -> {target}");
                             Directory.Move(d, target);
                             changeLines.Add($"{Path.GetFileName(d)} -> {Path.GetFileName(target)}");
                             dirMap.Remove(d);
-                            mapChanged = true;
                             restored++;
                         }
                         catch { errors++; }
                     }
-                    if (mapChanged) SaveDirMap(dirMap);
+                    SaveDirMap(dirMap);
                 }
             }
         }
@@ -275,15 +267,16 @@ class Program
 
         var finished = DateTimeOffset.Now;
 
+        var elapsedMs = (finished - started).TotalMilliseconds;
         await SendDiscordReport(new WebhookReport
         {
             Title = Undo ? "Pylo Restore" : "Pylo Rename",
             DryRun = DryRun,
             User = user,
             Machine = machine,
-            Desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+            Desktop = string.Join(";", desktops),
             Started = started,
-            Finished = finished,
+            ElapsedMs = elapsedMs,
             Renamed = renamed,
             Restored = restored,
             Skipped = skipped,
@@ -316,7 +309,7 @@ class Program
         public string Machine = "";
         public string Desktop = "";
         public DateTimeOffset Started;
-        public DateTimeOffset Finished;
+        public double ElapsedMs;
         public int Renamed;
         public int Restored;
         public int Skipped;
@@ -324,16 +317,24 @@ class Program
         public List<string> Changes = new();
     }
 
+    static IEnumerable<string> GetDesktopRoots()
+    {
+        string userDesk = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+        if (Directory.Exists(userDesk)) yield return userDesk;
+    }
+
     static IEnumerable<string> EnumerateFiles(string desktop)
     {
         foreach (var f in Directory.EnumerateFiles(desktop, "*", new EnumerationOptions { RecurseSubdirectories = false, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.System | FileAttributes.ReparsePoint }))
             yield return f;
     }
+
     static IEnumerable<string> EnumerateDirs(string desktop)
     {
         foreach (var d in Directory.EnumerateDirectories(desktop, "*", new EnumerationOptions { RecurseSubdirectories = false, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.System | FileAttributes.ReparsePoint }))
             yield return d;
     }
+
     static HashSet<string> SnapshotExisting(string desktop)
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -355,6 +356,7 @@ class Program
         try { using var s = new FileStream(path + ":pylo.orig", FileMode.Create, FileAccess.Write, FileShare.Read); using var w = new StreamWriter(s); w.Write(originalName); }
         catch { }
     }
+
     static string? TryReadADS(string path)
     {
         try { using var s = new FileStream(path + ":pylo.orig", FileMode.Open, FileAccess.Read, FileShare.ReadWrite); using var r = new StreamReader(s); return r.ReadToEnd().Trim(); }
@@ -363,9 +365,10 @@ class Program
 
     static string GetFullExtensionFromName(string name)
     {
-        int i = name.IndexOf('.');
+        int i = name.LastIndexOf('.');
         return i >= 0 ? name.Substring(i) : "";
     }
+
     static string MakeTempName(string originalPath, string suffix)
     {
         string dir = Path.GetDirectoryName(originalPath)!;
@@ -388,6 +391,7 @@ class Program
             i++;
         }
     }
+
     static string SanitizeFileName(string name)
     {
         foreach (var c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
@@ -404,6 +408,7 @@ class Program
         }
         catch { return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); }
     }
+
     static void SaveDirMap(Dictionary<string, string> map)
     {
         try
@@ -421,6 +426,7 @@ class Program
         }
         catch { }
     }
+
     static Dictionary<string, string> LoadDirMapMerged(List<string> lines, List<RenamePlan> plan, Dictionary<string, string> existing)
     {
         return existing;
@@ -450,10 +456,10 @@ class Program
             {
                 Field("User", report.User, true),
                 Field("Machine", report.Machine, true),
-                Field("Desktop", report.Desktop, false),
+                Field("Desktop Folder", report.Desktop, false),
                 Field("Mode", mode, true),
                 Field("Started", report.Started.ToString("u"), true),
-                Field("Finished", report.Finished.ToString("u"), true),
+                Field("Elapsed", report.ElapsedMs < 1000 ? $"{report.ElapsedMs:F0} ms" : $"{report.ElapsedMs/1000.0:F2} s", true),
                 Field("Renamed", report.Renamed.ToString(), true),
                 Field("Restored", report.Restored.ToString(), true),
                 Field("Skipped", report.Skipped.ToString(), true),
